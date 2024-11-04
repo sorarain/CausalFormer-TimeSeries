@@ -1,3 +1,4 @@
+import copy
 from data_provider.data_factory import data_provider
 from exp.exp_basic import Exp_Basic
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
@@ -13,6 +14,40 @@ from utils.dtw_metric import dtw,accelerated_dtw
 from utils.augmentation import run_augmentation,run_augmentation_single
 
 warnings.filterwarnings('ignore')
+
+p_lambda = 0.1
+beta1 = 0.5
+beta2 = 0.5
+last_W = None
+kappa_1 = 2.1
+kappa_2 = 0.9
+@torch.no_grad()
+def update_beta1(W, K):
+    global beta1, beta2, last_W, kappa_1, kappa_2
+    diagonal = (torch.exp(W * W)).diagonal(offset=0, dim1=-2, dim2=-1)
+    trace = diagonal.sum(dim=-1)
+    beta1 = 0.1 * beta1 + 0.1 * beta2 * (trace - K).mean()
+    beta1 = 0.1 if beta1 > 5 else beta1
+    # self.beta1 = self.beta1
+
+@torch.no_grad()
+def update_beta2(W, K):
+    # self.beta2=0.1
+    global beta1, beta2, last_W, kappa_1, kappa_2
+    diagonal = (torch.exp(W * W)).diagonal(offset=0, dim1=-2, dim2=-1)
+    trace = diagonal.sum(dim=-1)
+    left_value = torch.abs(trace - K).mean()
+    if last_W is not None:
+        diagonal = (torch.exp(last_W * last_W)).diagonal(offset=0, dim1=-2, dim2=-1)
+        trace = diagonal.sum(dim=-1)
+        right_value = kappa_2 * torch.abs(trace - K).mean()
+    else:
+        right_value = left_value
+    if left_value >= right_value:
+        beta2 = kappa_1 * beta2
+    last_W = copy.copy(W)
+
+    beta2 = 0.1 if beta2 > 5 else beta2
 
 
 class Exp_Long_Term_Forecast(Exp_Basic):
@@ -57,7 +92,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     with torch.cuda.amp.autocast():
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
-                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    if self.args.use_causal:
+                        outputs, causal_mask = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    else:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
@@ -121,13 +159,39 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         loss = criterion(outputs, batch_y)
                         train_loss.append(loss.item())
                 else:
-                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    if self.args.use_causal:
+                        outputs, causal_mask = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    else:
+                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
                     f_dim = -1 if self.args.features == 'MS' else 0
                     outputs = outputs[:, -self.args.pred_len:, f_dim:]
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                     loss = criterion(outputs, batch_y)
                     train_loss.append(loss.item())
+                    if self.args.use_causal:
+                        loss += self.args.p_lambda * torch.norm(causal_mask, 1, dim=[1,2]).mean()
+                        K = causal_mask.size(-1)
+                        diagonal = (torch.exp((causal_mask * causal_mask).clip(max=10))).diagonal(offset=0, dim1=-2, dim2=-1)
+                        trace = diagonal.sum(dim=-1)
+
+                        # loss += beta1 * abs(trace - K).mean()
+
+                        loss += beta1 * abs(trace - K).mean()
+                        loss += (beta2 / 2.0) * torch.pow(torch.abs(trace - K), 2).mean()
+                        # print(f"trace loss:{(trace - K).mean()}")
+                        # print(f"norm loss:{torch.norm(causal_mask, 1)}")
+                        assert not torch.any(torch.isinf(causal_mask)),"causal mask"
+                        assert not torch.any(torch.isnan(causal_mask)),"causal mask"
+
+                        assert not torch.any(torch.isinf(abs(trace - K).mean())),"trace"
+                        assert not torch.any(torch.isnan(abs(trace - K).mean())),"trace"
+                        assert not torch.any(torch.isinf(torch.pow(torch.abs(trace - K), 2).mean())),"trace"
+                        assert not torch.any(torch.isnan(torch.pow(torch.abs(trace - K), 2).mean())),"trace"
+                        assert not torch.any(torch.isinf(torch.norm(causal_mask, 1, dim=[1,2]).mean())),"plambda"
+                        assert not torch.any(torch.isnan(torch.norm(causal_mask, 1, dim=[1,2]).mean())),"plambda"
+                        update_beta1(causal_mask, K)
+                        update_beta2(causal_mask, K)
 
                 if (i + 1) % 100 == 0:
                     print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))

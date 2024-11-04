@@ -82,7 +82,7 @@ class Encoder(nn.Module):
 
 class DecoderLayer(nn.Module):
     def __init__(self, self_attention, cross_attention, d_model, d_ff=None,
-                 dropout=0.1, activation="relu"):
+                 dropout=0.1, activation="relu", use_causal=False):
         super(DecoderLayer, self).__init__()
         d_ff = d_ff or 4 * d_model
         self.self_attention = self_attention
@@ -94,18 +94,19 @@ class DecoderLayer(nn.Module):
         self.norm3 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
         self.activation = F.relu if activation == "relu" else F.gelu
+        self.use_causal = use_causal
 
-    def forward(self, x, cross, x_mask=None, cross_mask=None, tau=None, delta=None):
+    def forward(self, x, cross, x_mask=None, cross_mask=None, x_causal_mask=None, cross_causal_mask=None, tau=None, delta=None):
         x = x + self.dropout(self.self_attention(
             x, x, x,
-            attn_mask=x_mask,
+            attn_mask=x_mask,causal_mask=x_causal_mask,
             tau=tau, delta=None
         )[0])
         x = self.norm1(x)
 
         x = x + self.dropout(self.cross_attention(
             x, cross, cross,
-            attn_mask=cross_mask,
+            attn_mask=cross_mask,causal_mask=cross_causal_mask,
             tau=tau, delta=delta
         )[0])
 
@@ -113,19 +114,26 @@ class DecoderLayer(nn.Module):
         y = self.dropout(self.activation(self.conv1(y.transpose(-1, 1))))
         y = self.dropout(self.conv2(y).transpose(-1, 1))
 
-        return self.norm3(x + y)
+        if self.use_causal:
+            return self.norm3(x + y), x_causal_mask, cross_causal_mask
+        else:
+            return self.norm3(x + y)
 
 
 class Decoder(nn.Module):
-    def __init__(self, layers, norm_layer=None, projection=None):
+    def __init__(self, layers, norm_layer=None, projection=None, use_causal=False):
         super(Decoder, self).__init__()
         self.layers = nn.ModuleList(layers)
         self.norm = norm_layer
         self.projection = projection
+        self.use_causal = use_causal
 
-    def forward(self, x, cross, x_mask=None, cross_mask=None, tau=None, delta=None):
+    def forward(self, x, cross, x_mask=None, cross_mask=None, x_causal_mask=None, cross_causal_mask=None, tau=None, delta=None):
         for layer in self.layers:
-            x = layer(x, cross, x_mask=x_mask, cross_mask=cross_mask, tau=tau, delta=delta)
+            if self.use_causal:
+                x, x_causal_mask, cross_causal_mask = layer(x, cross, x_mask=x_mask, cross_mask=cross_mask, x_causal_mask=x_causal_mask, cross_causal_mask=cross_causal_mask, tau=tau, delta=delta)
+            else:
+                x = layer(x, cross, x_mask=x_mask, cross_mask=cross_mask, tau=tau, delta=delta)
 
         if self.norm is not None:
             x = self.norm(x)

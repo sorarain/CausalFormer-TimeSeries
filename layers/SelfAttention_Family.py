@@ -178,7 +178,7 @@ class ProbAttention(nn.Module):
 
 class AttentionLayer(nn.Module):
     def __init__(self, attention, d_model, n_heads, d_keys=None,
-                 d_values=None):
+                 d_values=None, use_causal=False, alpha = 0.0):
         super(AttentionLayer, self).__init__()
 
         d_keys = d_keys or (d_model // n_heads)
@@ -191,7 +191,10 @@ class AttentionLayer(nn.Module):
         self.out_projection = nn.Linear(d_values * n_heads, d_model)
         self.n_heads = n_heads
 
-    def forward(self, queries, keys, values, attn_mask, tau=None, delta=None):
+        self.use_causal = use_causal
+        self.alpha = alpha
+
+    def forward(self, queries, keys, values, attn_mask, causal_mask=None, tau=None, delta=None):
         B, L, _ = queries.shape
         _, S, _ = keys.shape
         H = self.n_heads
@@ -200,17 +203,31 @@ class AttentionLayer(nn.Module):
         keys = self.key_projection(keys).view(B, S, H, -1)
         values = self.value_projection(values).view(B, S, H, -1)
 
-        out, attn = self.inner_attention(
-            queries,
-            keys,
-            values,
-            attn_mask,
-            tau=tau,
-            delta=delta
-        )
+        if self.use_causal:
+            out, attn, causal_mask = self.inner_attention(
+                queries,
+                keys,
+                values,
+                attn_mask,
+                causal_mask=causal_mask,
+                tau=tau,
+                delta=delta
+            )
+        else:
+            out, attn = self.inner_attention(
+                queries,
+                keys,
+                values,
+                attn_mask,
+                tau=tau,
+                delta=delta
+            )
         out = out.view(B, L, -1)
 
-        return self.out_projection(out), attn
+        if self.use_causal:
+            return self.out_projection(out), attn, causal_mask
+        else:
+            return self.out_projection(out), attn
 
 
 class ReformerLayer(nn.Module):
@@ -300,3 +317,50 @@ class TwoStageAttentionLayer(nn.Module):
         final_out = rearrange(dim_enc, '(b seg_num) ts_d d_model -> b ts_d seg_num d_model', b=batch)
 
         return final_out
+
+
+class FullCausalAttention(nn.Module):
+    def __init__(self, mask_flag=True, factor=5, scale=None, attention_dropout=0.1, output_attention=False, output_causal=False, alpha=0.0):
+        super(FullCausalAttention, self).__init__()
+        self.scale = scale
+        self.mask_flag = mask_flag
+        self.output_attention = output_attention
+        self.output_causal = output_causal
+        self.alpha = alpha
+        self.dropout = nn.Dropout(attention_dropout)
+
+    def forward(self, queries, keys, values, attn_mask, causal_mask=None, tau=None, delta=None):
+        B, L, H, E = queries.shape
+        _, S, _, D = values.shape
+        scale = self.scale or 1. / sqrt(E)
+
+        scores = torch.einsum("blhe,bshe->bhls", queries, keys)
+
+        if self.mask_flag:
+            if attn_mask is None:
+                attn_mask = TriangularCausalMask(B, L, device=queries.device)
+
+            scores.masked_fill_(attn_mask.mask, -np.inf)
+
+            if causal_mask is not None:
+                if causal_mask.dim() == 2:
+                    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).repeat(scores.size(0),scores.size(1),1,1)
+                elif causal_mask.dim() == 3:
+                    causal_mask = causal_mask.unsqueeze(1)
+                else:
+                    assert 1 == 0
+                scores *= (1 + self.alpha * causal_mask)
+
+        A = self.dropout(torch.softmax(scale * scores, dim=-1))
+        V = torch.einsum("bhls,bshd->blhd", A, values)
+
+        if self.output_attention:
+            if self.output_causal:
+                return V.contiguous(), A, causal_mask
+            else:
+                return V.contiguous(), A
+        else:
+            if self.output_causal:
+                return V.contiguous(), None, causal_mask
+            else:
+                return V.contiguous(), None
